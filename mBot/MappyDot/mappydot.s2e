@@ -1,0 +1,36 @@
+{	"extensionName": "MappyDot",
+	"description": "MappyDot Distance Measurement Sensor",
+	"version": "1.0",
+	"author": "SensorDots",
+	"homepage": "sensordots.org",
+	"sort":0,
+	"javascriptURL":"js/mappydot.js",
+    "firmware":"1.0",
+    "extensionPort":0,
+	"blockSpecs": [
+		[
+			"R", 
+			"mappydot sensor at address %n on %d.whitePorts distance",
+			"getDistance",
+			"8",
+			"Port1",
+			{
+				"setup":"",
+				"inc":"#include \"mappydot.h\"\n",
+				"def":"MappyDot mappydot_{1}_{0}({0}); \n",
+				"work":"mappydot_{1}_{0}.getDistance()",
+				"loop":""
+			}
+		]
+	],
+	"menus": {
+    	"whitePorts":["Port1","Port2","Port3","Port4"]
+	},
+	"values":{
+		"mappydot":1,
+		"Port1":1,
+		"Port2":2,
+		"Port3":3,
+		"Port4":4
+	}
+}
