@@ -35,6 +35,6 @@ MappyDot::MappyDot(uint8_t mappydot_address){
 uint16_t MappyDot::getDistance()
 {
 	Wire.requestFrom(address, 2); 
-	uint16_t distance = Wire.read() << 8 | Wire.read();
+	uint16_t distance = Wire.read() << 8; distance |= Wire.read(); 
 	return distance;
 }
