@@ -28,7 +28,6 @@ void mm_to_bytes(uint8_t *bytes, uint16_t mm)
 }
 
 MappyDot::MappyDot(uint8_t mappydot_address){
-	delay(2000);
 	Wire.begin();
 	address = mappydot_address;
 }
