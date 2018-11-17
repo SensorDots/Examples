@@ -1,5 +1,5 @@
-{	"extensionName": "MappyDot",
-	"description": "MappyDot Distance Measurement Sensor",
+{	"extensionName": "MappyDot LiDAR Hat",
+	"description": "MappyDot LiDAR Hat- https://www.tindie.com/products/blecky/lidar-hat-for-mbotlego-ev3/",
 	"version": "1.0",
 	"author": "SensorDots",
 	"homepage": "sensordots.org",
