@@ -62,7 +62,7 @@ void backpack_begin(uint8_t address) {
 	i2c_stop_external();
 	backpack_blinkRate(HT16K33_BLINK_OFF);
 
-	backpack_setBrightness(8);
+	backpack_setBrightness(10);
 }
 
 void backpack_writeDisplay(void) {

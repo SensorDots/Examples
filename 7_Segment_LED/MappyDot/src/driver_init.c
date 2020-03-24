@@ -189,16 +189,20 @@ void system_init()
         // <id> pad_initial_level
         // <false"> Low
         // <true"> High
-        false);
+        true);
+
     /* PORT setting on PC3 */
     // Set pin direction to input
     GPIO1_set_dir(PORT_DIR_IN);
+
+	//Pullups removed on Rev.01c, will still work with Rev.01b and lower boards.
     GPIO1_set_pull_mode(
         // <y> Pull configuration
         // <id> pad_pull_config
         // <PORT_PULL_OFF"> Off
         // <PORT_PULL_UP"> Pull-up
-        PORT_PULL_OFF);
+        PORT_PULL_UP);
+
     /* PORT setting on PD3 */
     // Set pin direction to input
     GND_set_dir(PORT_DIR_IN);
@@ -233,4 +237,6 @@ void system_init()
     I2C_1_initialization();
     //TIMER_0_initialization();
     //TIMER_1_initialization();
+
+	UNUSED_set_input();
 }

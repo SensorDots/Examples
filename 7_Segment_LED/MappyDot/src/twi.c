@@ -53,7 +53,7 @@
 
 void I2C_0_init()
 {
-    /* Enable TWI0 */
+    ///* Enable TWI0 */
     PRR0 &= ~(1 << PRTWI0);
     TWCR0 = (1 << TWEN)   /* TWI0: enabled */
             | (0 << TWIE) /* TWI0 Interrupt: disabled */
@@ -62,6 +62,16 @@ void I2C_0_init()
     /* Configured bit rate is 400.000kHz, based on CPU frequency 8.000MHz */
     TWBR0 = 0x02;          /* SCL bit rate: 400.000kHZ before prescaling */
     TWSR0 = 0x00 << TWPS0; /* SCL precaler: 1, effective bitrate = 400.000kHz */
+
+	/* Enable TWI0 */
+	//PRR0 &= ~(1 << PRTWI0);
+	//TWCR0 = (1 << TWEN)   /* TWI0: enabled */
+	//| (0 << TWIE) /* TWI0 Interrupt: disabled */
+	//| (0 << TWEA) /* TWI0 Acknowledge: disabled */;
+	///* SCL bitrate = F_CPU / (16 + 2 * TWBR0 * TWPS value) */
+	///* Configured bit rate is 100.000kHz, based on CPU frequency 8.000MHz */
+	//TWBR0 = 0x20;          /* SCL bit rate: 100.000kHZ before prescaling */
+	//TWSR0 = 0x00 << TWPS0; /* SCL precaler: 1, effective bitrate = 100.000kHz */
 }
 
 int8_t I2C_1_init()
@@ -69,13 +79,11 @@ int8_t I2C_1_init()
     /* Enable TWI1 */
     PRR1 &= ~(1 << PRTWI1);
     TWCR1 = (1 << TWEN)   /* TWI1: enabled */
-            | (0 << TWIE) /* TWI1 Interrupt: disabled */
-            | (0 << TWEA) /* TWI1 Acknowledge: disabled */;
-    /* SCL bitrate = F_CPU / (16 + 2 * TWBR0 * TWPS value) */
-    /* Configured bit rate is 400.000kHz, based on CPU frequency 8.000MHz */
-	// TWBR1 = ((F_CPU / frequency) - 16) / 2;
-    TWBR1 = 0x20;          /* SCL bit rate: 100.000kHZ before prescaling */
-    TWSR1 = 0x00 << TWPS0; /* SCL precaler: 1, effective bitrate = 100.000kHz */
+            | (1 << TWIE) /* TWI1 Interrupt: enabled */
+            | (1 << TWEA) /* TWI1 Acknowledge: enabled */;
+    TWAR1 = (0x07 << TWA0) /* TWI1 (Slave) Address: 7 */
+            | (1 << TWGCE) /* TWI1 General Call Recognition: enabled */;
+    TWAMR1 = (0x00 << TWAM0) /* TWI1 (Slave) Address Mask: 0 */;
     return 0;
 }
 

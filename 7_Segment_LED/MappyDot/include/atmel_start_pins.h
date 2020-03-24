@@ -549,6 +549,24 @@ static inline void GND_set_level(const bool level)
 }
 
 /**
+ * \brief Set all unused pins to pulldown to save power
+ *
+ */
+static inline void UNUSED_set_input()
+{
+   //PD4,PD2,PD1,PD0,PE2,PD6,PD7,PB0,PB1,PB2
+   PORTD_set_pin_dir(4, PORT_DIR_IN);
+   PORTD_set_pin_dir(2, PORT_DIR_IN);
+   PORTD_set_pin_dir(0, PORT_DIR_IN);
+   PORTE_set_pin_dir(2, PORT_DIR_IN);
+   PORTD_set_pin_dir(6, PORT_DIR_IN);
+   PORTD_set_pin_dir(7, PORT_DIR_IN);
+   PORTB_set_pin_dir(0, PORT_DIR_IN);
+   PORTB_set_pin_dir(1, PORT_DIR_IN);
+   PORTB_set_pin_dir(2, PORT_DIR_IN);
+}
+
+/**
  * \brief Toggle output level on GND
  *
  * Toggle the pin level

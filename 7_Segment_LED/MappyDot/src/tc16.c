@@ -143,3 +143,50 @@ void TIMER_1_stop()
 			 | 0 << ICES3 /* Input Capture Edge Select: disabled */
 			 | (0 << CS32) | (0 << CS31) | (0 << CS30); /* No clock source (Timer/Counter stopped) */
 }
+
+/**
+ * \brief Initialize TIMER_2 interface
+ */
+int8_t TIMER_2_init()
+{
+	/* Enable TC4 */
+	PRR1 &= ~(1 << PRTIM4);
+
+	// TCCR4A = (0 << COM4A1) | (0 << COM4A0) /* Normal port operation, OCA disconnected */
+	//		 | (0 << COM4B1) | (0 << COM4B0) /* Normal port operation, OCB disconnected */
+	//		 | (0 << WGM41) | (0 << WGM40); /* TC16 Mode 0 Normal */
+
+	TCCR4B = (0 << WGM43) | (0 << WGM42)                /* TC16 Mode 0 Normal */
+	         | 0 << ICNC4                               /* Input Capture Noise Canceler: disabled */
+	         | 0 << ICES4                               /* Input Capture Edge Select: disabled */
+	         //| (0 << CS42) | (1 << CS41) | (1 << CS40); /* IO clock divided by 64 */
+			 | (1 << CS42) | (0 << CS41) | (0 << CS40); /* IO clock divided by 256 */
+
+	// ICR4 = 0; /* Input capture value, used as top counter value in some modes: 0 */
+
+	// OCR4A = 0; /* Output compare A: 0 */
+
+	// OCR4B = 0; /* Output compare B: 0 */
+
+	TIMSK4 = 0 << OCIE4B   /* Output Compare B Match Interrupt Enable: disabled */
+	         | 0 << OCIE4A /* Output Compare A Match Interrupt Enable: disabled */
+	         | 0 << ICIE4  /* Input Capture Interrupt Enable: disabled */
+	         | 1 << TOIE4; /* Overflow Interrupt Enable: enabled */
+	return 0;
+}
+
+void TIMER_2_reset()
+{
+    //reset the counter, clear the timer's count register (TCNTx).
+
+    TCNT4 = 0;	
+}
+
+void TIMER_2_stop()
+{
+
+	TCCR4B = (0 << WGM43) | (1 << WGM42) /* TC16 Mode 0 Normal */
+	| 0 << ICNC4 /* Input Capture Noise Canceler: disabled */
+	| 0 << ICES4 /* Input Capture Edge Select: disabled */
+	| (0 << CS42) | (0 << CS41) | (0 << CS40); /* No clock source (Timer/Counter stopped) */
+}

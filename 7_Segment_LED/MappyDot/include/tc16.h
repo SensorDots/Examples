@@ -85,6 +85,17 @@ extern "C" {
 
 	void TIMER_1_set_duty(uint8_t duty);
 
+	/**
+	 * \brief Initialize TIMER_2 interface
+	 *
+	 * \return Initialization status.
+	 */
+	int8_t TIMER_2_init();
+
+	void TIMER_2_stop();
+
+	void TIMER_2_reset();
+
 #ifdef __cplusplus
     }
 #endif

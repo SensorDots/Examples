@@ -16,13 +16,6 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-   Features Not Currently Implemented
-
-   - I2C Passthrough Mode
-   - MappyDot Mode
-   - Set as master for inter-device crosstalk. This allows you to group devices.
-   - Add Initisation Error Codes
-
    ATmega328pb:
    Fuse E: 0xfd (2.7V BOD)
    Fuse H: 0xd4 (512 words bootloader)
@@ -34,447 +27,490 @@
    disable some functions or disable the bootloader and BOOTRST. 
    Some non critical functions can be disabled with the DEV_DISABLE 
    compiler flag.
-   Compiled size needs to be under 7C00 bytes to work with bootloader 
+   Compiled size needs to be under 7C00 bytes to work with bootloader.
+
+   NO_INT compile flag is used to test the VL53L0X without the interupt
+   pin. This should not be used under normal circumstances. This is for
+   debugging purposes only.
 
  */
 
 #include <atmel_start.h>
 #include <avr/wdt.h>
-#include <math.h>
 #include <string.h>
-#include <util/delay.h>
-#include "vl53l0x.h"
+#include "vl53l1x.h"
+#include "addr.h"
 #include "history_buffer.h"
 #include "bwlpf.h"
 #include "mappydot_reg.h"
 #include "tc16.h"
+#include "nvmctrl.h"
+#include "crc8.h"
 #include "stackmon.h"
-#include "vl53l0x_types.h"
+#include "vl53l1_types.h"
 #include "main.h"
+#include "sleeping.h"
+#include "helper.h" //Main helper function
 #include "led_backpack.h"
+
 
 #ifdef DEV_DISABLE
 #warning Some functions are disabled with DEV_DISABLE
 #endif
 
+#define VERSION_STRING                "MDPFW_V1.2"
 
-#define RANGE_TIMEOUT_VALUE           300000
-#define FILTER_ORDER                  2  //Filter order
-#define SAMPLING_FREQ                 30 //Samples per second
+#define EEPROM_ADDRESS_BYTE           0x01
+#define EEPROM_BOOTLOADER_BYTE        0x02
+#define EEPROM_DEVICE_NAME            0x20
+#define EEPROM_FACTORY_SETTINGS_START 0x40
+#define EEPROM_USER_SETTINGS_START    0x60
+#define EEPROM_FACTORY_CALIB_START    0x80 //Size 95 bytes
+#define EEPROM_USER_CALIB_START       0xF0
+
 #define FILTER_FREQUENCY              6  //Hz
-#define MIN_DIST                      30 //minimum distance from VL53L0X
-#define MAX_DIST                      4000 //Max sanity distance from VL53L0X
+#define SETTINGS_SIZE                 21
+#define CALIB_SIZE                    95
+#define MIN_DIST                      30 //minimum distance from VL53L1X
+#define MAX_DIST                      5000 //Max sanity distance from VL53L1X
 #define ACCURACY_LIMIT                1200
-#define T_BOOT_MS                     2 //tBOOT is 1.2ms max as per VL53L0X datasheet
+//#define T_BOOT_MS                     2
 
-/* Private methods */
-#ifndef DEV_DISABLE
-static uint16_t avg(uint16_t * array, uint8_t count);
-#endif
-static void flash_led(uint32_t timeout_ms, int8_t num_of_flashes, bool pwm);
-static uint8_t translate_measurement_mode(uint8_t measurement_mode);
-static uint8_t translate_ranging_mode(uint8_t ranging_mode);
-static void delay_ms(uint16_t ms);
 
 
 /* State Variables */
 #ifndef DEV_DISABLE
 circular_history_buffer history_buffer;
 #endif
+int16_t slave_address;
 filter_state low_pass_filter_state;
 
 /* We do this so the struct is allocated as pointers are not allocated */
-VL53L0X_Dev_t device;
-VL53L0X_Dev_t * pDevice;
-VL53L0X_RangingMeasurementData_t measure;
-VL53L0X_Error status;
+VL53L1_Dev_t device;
+VL53L1_Dev_t * pDevice;
+VL53L1_RangingMeasurementData_t measure;
+VL53L1_Error status;
+VL53L1_UserRoi_t ROI;
 
-uint16_t filtered_distance;
-uint16_t real_distance;
-uint8_t error_code;
-uint16_t distance_error;
-uint16_t current_millimeters  = 0;
+#define HISTORY_SIZE 6
 
-volatile bool filtering_enabled  = 1;
-volatile bool averaging_enabled  = 1;
-volatile bool vl53l0x_powerstate = 0;
-volatile bool passthrough_mode   = 0;
+uint16_t filtered_distance         = 0;
+uint16_t real_distance             = 0;
+uint8_t error_code                 = 0;
+uint16_t distance_error            = 0;
+uint16_t current_millimeters       = 0;
+uint16_t signal_rate_rtn_mega_cps  = 0;
+uint16_t ambient_rate_rtn_mega_cps = 0;
 
-volatile uint8_t led_mode                      = LED_PWM_ENABLED;
-volatile uint8_t gpio_mode                     = GPIO_MEASUREMENT_INTERRUPT;
-volatile uint8_t current_ranging_mode          = SET_CONTINUOUS_RANGING_MODE;
-volatile uint8_t current_measurement_mode      = LONG_RANGE;
-volatile uint32_t led_threshold                = 1000;
-volatile uint32_t gpio_threshold               = 300;
-volatile uint8_t averaging_size                = 15;
+bool filtering_enabled  = 1;
+bool averaging_enabled  = 1;
+bool factory_mode       = 0;
+bool crosstalk_enabled  = 0;
+bool vl53l1x_powerstate = 0;
+bool is_master          = 0;
 
-/* SPAD Calibration */
-uint32_t refSpadCount = 0;
-uint8_t ApertureSpads = 0;
+uint8_t led_mode                      = LED_PWM_ENABLED;
+uint8_t gpio_mode                     = GPIO_LOW;
+uint8_t current_ranging_mode          = SET_CONTINUOUS_RANGING_MODE; //SET_SINGLE_RANGING_MODE; 
+uint8_t current_measurement_mode      = MED_RANGE;
+uint32_t led_threshold                = 600;
+uint32_t gpio_threshold               = 300;
+uint8_t averaging_size                = HISTORY_SIZE;
+uint8_t current_average_size          = 0;
+uint8_t intersensor_crosstalk_delay   = 0;
+uint8_t intersensor_crosstalk_timeout = 40; //40*ticks
+uint16_t measurement_budget           = 50; //ms
+uint8_t read_interrupt                = 0;
+uint16_t signal_limit_check           = 1000;
+uint8_t sigma_limit_check             = 15;
+uint8_t intersensor_sync              = 0;
 
-/* Distance Calibration */
-int32_t offsetMicroMeter = 0;
+VL53L1_CalibrationData_t calibration_data;
+bool got_calibration_data = false;
 
-/* Crosstalk (cover) Calibration */
-FixPoint1616_t xTalkCompensationRateMegaCps = 0;
-
-/* Temperature Calibrate */
-uint8_t vhvSettings = 0;
-uint8_t phaseCal = 0;
-
-int8_t led_pulse = 0;
-uint8_t led_pulse_dir = 0;
+int8_t led_pulse           = 0;
+uint8_t led_pulse_dir      = 0;
 uint16_t led_pulse_timeout = 0;
+uint8_t ignore_next_filter = 0;
+
+int16_t temp_buffer[HISTORY_SIZE];
+
+
+
+#define SETTLE_MEASUREMENTS 2
+int8_t run_until_settle    = SETTLE_MEASUREMENTS;
+
+
+/* Command handler */
+bool command_to_handle;
+uint8_t todo_command;
+uint8_t todo_arg[16];
+uint8_t todo_arg_length;
 
 static volatile bool measurement_interrupt_fired = false;
+static volatile bool interrupt_timeout_interrupt_fired = false;
+static volatile bool crosstalk_sync_interrupt_fired = false;
+static volatile bool calibrating = false;
+uint8_t mappydot_name[16];
+uint8_t settings_buffer[SETTINGS_SIZE + 2]; //(+2 is for code reuse)
 
 int main(void)
 {	   
     /* Initializes MCU, drivers and middleware */
     atmel_start_init();
 
+	/* Disables analog comparator to save power */
+    disable_analog();
+
     /* Set XSHUT to high to turn on (Shutdown is active low). */
-    XSHUT_set_level(true);
-	//_delay_ms(T_BOOT_MS);
+	//This is now done in start_init
+    //XSHUT_set_level(true);
+	//_delay_ms(T_BOOT_MS); //no longer required
 
-    /* Set sync to input and no pull mode as it's connected to MST. */
-    SYNC_set_dir(PORT_DIR_IN);
-    SYNC_set_pull_mode(PORT_PULL_OFF);
-
-	/* Enable interrupts */
-    sei();
-
+    /* Set sync to input and no pull mode as if it's connected to MST. */
+    //This is now done in start_init
+    //SYNC_set_dir(PORT_DIR_IN);
+    //SYNC_set_pull_mode(PORT_PULL_OFF);
 
 	/* Setup Crosstalk reduction interrupt */
 	/* PB6 - PCINT6 (PCMSK1) */
 	PCICR |= (1 << PCIE0);    // set PCIE0 to enable PCMSK0 scan
 	PCMSK0 |= (1 << PCINT6);  // set PCINT6 to trigger an interrupt on state change
-#ifndef DEV_DISABLE
 
-    /* Initialise history buffer */
-    hb_init(&history_buffer,averaging_size,sizeof(uint16_t));
+	/* Ranging Interrupt setup */
+	/* Interrupt is active low when fired (after ranging complete), rather than high. */
+	/* Set GPIO1 (interrupt) pin to input */
+	GPIO1_set_dir(PORT_DIR_IN);
+	GPIO1_set_pull_mode(PORT_PULL_OFF);
 
-    /* Initialise Filter */
-    bwlpf_init(&low_pass_filter_state,FILTER_ORDER,SAMPLING_FREQ,FILTER_FREQUENCY);
+	/* Setup measurement interrupt */
+	/* PC3 - PCINT11 (PCMSK1) */
+	PCICR |= (1 << PCIE1);    // set PCIE1 to enable PCMSK1 scan
+	PCMSK1 |= (1 << PCINT11);  // set PCINT11 to trigger an interrupt on state change
 
-#endif
+	/* Init EEPROM */
+    //FLASH_0_init();
 
-    /* Ranging Interrupt setup */
-    /* Interrupt is active low when fired (after ranging complete), rather than high. */
-    /* Set GPIO1 (interrupt) pin to input */
-    GPIO1_set_dir(PORT_DIR_IN);
-    GPIO1_set_pull_mode(PORT_PULL_OFF);
+	/* Enable interrupts */
+    sei();
 
-    /* GPIO POUT Setup */
-    SYNC_set_dir(PORT_DIR_OUT);
+	/* Read calibration data */
+	/*uint8_t * calib_ptr = (uint8_t *)&calibration_data;
 
-    /* Setup measurement interrupt */
-    /* PC3 - PCINT11 (PCMSK1) */
-    PCICR |= (1 << PCIE1);    // set PCIE1 to enable PCMSK1 scan
-    PCMSK1 |= (1 << PCINT11);  // set PCINT11 to trigger an interrupt on state change
+	FLASH_0_read_eeprom_block(EEPROM_USER_CALIB_START, calib_ptr, CALIB_SIZE);
+	uint8_t crc_calib = Crc8(calib_ptr, CALIB_SIZE);*/
 
+	/* Sanity checks CRC when EEPROM is all zeros */
+	/*if (crc_calib == 0x00 && calibration_data.customer.global_config__spad_enables_ref_0 == 0x00
+		&& calibration_data.customer.global_config__spad_enables_ref_1 == 0x00
+		&& calibration_data.customer.global_config__spad_enables_ref_2 == 0x00
+		&& calibration_data.customer.global_config__spad_enables_ref_3 == 0x00) crc_calib = 0x01;*/
+
+	got_calibration_data = false;
+	
 
 	#ifdef FILL_SRAM_DEBUG
-	int16_t count = StackCount();
+	//int16_t count = StackCount();
 	#endif
 
-	/* VL53L0X Init */
+	/* VL53L1X Init */
 
 	/* Assign struct to pointer */
 	pDevice = &device;
 
-	if (!init_ranging(pDevice, &status, translate_ranging_mode(current_ranging_mode), translate_measurement_mode(current_measurement_mode),
-					  refSpadCount,ApertureSpads,offsetMicroMeter,xTalkCompensationRateMegaCps,vhvSettings,phaseCal))
+	/* Run init in continous mode (0) until measurements settle */
+	if (!init_ranging(pDevice, &status, 0, current_measurement_mode, measurement_budget, &ROI,
+					  &calibration_data, got_calibration_data))
 	{
 		/* Ops we had an init failure */
 		flash_led(5,-1, 1);
 	}
 
-	measurement_interrupt_fired = false;
-	resetVl53l0xInterrupt(pDevice, &status);
+	#ifndef DEV_DISABLE
 
-	uint32_t rangeTimeout = RANGE_TIMEOUT_VALUE;
+	/* Initialise history buffer */
+	hb_init(&history_buffer,averaging_size,sizeof(uint16_t));
+
+	/* Initialise Filter */
+	bwlpf_init(&low_pass_filter_state,1000/measurement_budget,FILTER_FREQUENCY);
+
+	#endif
+
+	measurement_interrupt_fired = false;
 
 	/* Enable PWM timer if PWM enabled */
-	if ( gpio_mode == GPIO_PWM_ENABLED) TIMER_0_init();
 
 	if (led_mode == LED_PWM_ENABLED ) TIMER_1_init();
 
 	static uint8_t led_duty_cycle = 0;
-    static uint8_t gpio_duty_cycle = 0;
+
+	run_until_settle    = SETTLE_MEASUREMENTS;
+
+	resetVL53L1Interrupt(pDevice, &status);
+
+	#ifdef NO_INT
+	uint32_t no_interrupt_counter = 0;
+	#else
+	/* Start no interrupt timer */
+	//if (current_ranging_mode == SET_CONTINUOUS_RANGING_MODE) TIMER_2_init(); //Now set in vl53l1x.c
+	#endif
 
 	/* Setup the display. */
 	backpack_begin(0xE0);
 
+	int16_t prev_measurement = 0;
+
+
     /* Main code */
     while (1)
-    {	
-		if (measurement_interrupt_fired)
-		{
-			/* We can do a fair bit of work here once the ranging has complete, 
-			* because the VL53L0X is now busy getting another range ready. */
-
-			measurement_interrupt_fired = false;
-
-			rangeTimeout = RANGE_TIMEOUT_VALUE;
-
-			/* If we are in measurement output modes */
-			if (led_mode == LED_MEASUREMENT_OUTPUT) LED_set_level(false);
-
-			if (gpio_mode == GPIO_MEASUREMENT_INTERRUPT) SYNC_set_level(true);
-
-			/* Read current mm */
-			readRange(pDevice, &status, &measure);
-
-			error_code = measure.RangeStatus;
-			/* If not phase error */
-			if (measure.RangeStatus != 4)
-			{
-				current_millimeters = measure.RangeMilliMeter;
-				distance_error = (uint32_t)measure.Sigma >> 16;
-			} else {
-				current_millimeters = 0;
-				distance_error = 0;
-			}			
-
-			/* 0 is invalid measurement */
-
-			/* Do some sanity checking (if measurement greater than 4 meters) */
-			if (current_millimeters >= MAX_DIST) current_millimeters = 0;
-
-			/* Valid measurements come out of the sensor as values > 30mm. */
-			if (current_millimeters <= MIN_DIST && current_millimeters > 0) current_millimeters = MIN_DIST;
-
-			real_distance = current_millimeters;
-			filtered_distance = real_distance;
-
-			if (filtered_distance != 0)
-			{
-                
-#ifndef DEV_DISABLE
-
-				if (filtering_enabled)
-					filtered_distance = bwlpf(filtered_distance, &low_pass_filter_state);
-
-				/* Averaging happens after filtering */
-				if (averaging_enabled)
-				{
-					//Push current measurement into ring buffer for filtering
-					hb_push_back(&history_buffer, &filtered_distance);
-					filtered_distance = avg(history_buffer.buffer,averaging_size);
-				}
-#endif
-			}
-			
-			/* Output modes */
-			if (led_mode == LED_THRESHOLD_ENABLED)
-			{
-				if (filtered_distance <= led_threshold && filtered_distance != 0)
-				{
-					/* Turn on LED */
-					LED_set_level(false);
-				}
-
-				else
-				{
-					/* Turn off LED */
-					LED_set_level(true);
-				}
-			}
-
-			if (gpio_mode == GPIO_THRESHOLD_ENABLED)
-			{
-				if (filtered_distance <= gpio_threshold && filtered_distance != 0)
-				{
-					/* Turn on GPIO */
-					SYNC_set_level(true);
-					
-				}
-
-				else
-				{
-					/* Turn off GPIO */
-					SYNC_set_level(false);
-				}
-			}
-
-			/* If we are in measurement output modes */
-			/* Note that in some modes this will output very quickly (around 60Hz)
-				when there is no valid measurement */
-			if (led_mode == LED_MEASUREMENT_OUTPUT) LED_set_level(true);
-
-			if (gpio_mode == GPIO_MEASUREMENT_INTERRUPT) SYNC_set_level(false);
-
-			/* Calculate "Software" (Timer Based) PWM */
-			/* This is pretty lightweight, it just uses software to calc the duty cycle.
-				* Timers then work to fire the pins. */
-
-			if (measure.RangeStatus != 3 && measure.RangeStatus != 4) //If min range failure hasn't occurred
-			{ 
-			    backpack_print(filtered_distance, 10);
-			    backpack_writeDisplay();
-
-				if (filtered_distance > led_threshold) led_duty_cycle = 0;
-				else if (filtered_distance == 0) led_duty_cycle = 0; //Stop "bounce" when invalid measurement
-				else led_duty_cycle = (led_threshold - filtered_distance)*100/(led_threshold - MIN_DIST);
-
-				//if (led_duty_cycle > 99) led_duty_cycle = 99; // Done in set_duty
-
-				if (filtered_distance > gpio_threshold) gpio_duty_cycle = 0;
-				else if (filtered_distance == 0) gpio_duty_cycle = 0; //Stop "bounce" when invalid measurement
-				else gpio_duty_cycle = (gpio_threshold - filtered_distance)*100/(gpio_threshold - MIN_DIST);
-
-				//if (gpio_duty_cycle > 99) gpio_duty_cycle = 99; // Done in set_duty
-
-			} else {
-				led_duty_cycle = 0;
-				gpio_duty_cycle = 0;
-					
-			}
-			TIMER_1_set_duty(led_duty_cycle);
-			TIMER_0_set_duty(gpio_duty_cycle);
-		} 
-
-		else
-		{
-			rangeTimeout--;
-
-
-			/* Reset interrupt if we have a communication timeout */
-			if (rangeTimeout == 0)
-			{
-				rangeTimeout = RANGE_TIMEOUT_VALUE;
-				resetVl53l0xInterrupt(pDevice, &status);
-			}
-		}
-	}
-}
-
-/**
- * \brief _delay_ms helper function
- * 
- * \param ms
- * 
- * \return void
- */
-void delay_ms(uint16_t ms)
-{
-	while (0 < ms)
-	{
-		_delay_ms(1);
-		--ms;
-	}
-}
-
-
-/**
- * \brief Flash LED
- * 
- * \param flash_ms between state chances, double this value for the period
- * \param num_of_flashes (-1 for indefinite)
- * 
- * \return void
- */
-static void flash_led(uint32_t timeout_ms, int8_t num_of_flashes, bool pwm)
-{
-    /* Turn off LED */
-    LED_set_level(true);
-
-	delay_ms(timeout_ms);
-
-	//Can only breath in indefinite mode
-    if (pwm && num_of_flashes == -1)
-	{
-		uint8_t i = 0;
-		TIMER_1_init();
-
-		while (1)
-		{	
-			if (i >= 99) i = 0;
-			TIMER_1_set_duty(i);
-			delay_ms(timeout_ms);
-			i++;
-		}
-		
-	}
-	while (abs(num_of_flashes) > 0)
     {
-	    delay_ms(timeout_ms);
+	    #ifdef NO_INT
+	    no_interrupt_counter++;
+		#endif
+	    if (!calibrating)
+		{	
+		    /* Put the microcontroller to sleep
+			   Everything after this is affected by interrupts */
+		    #ifndef DEBUG
+				sleep_avr();
+			#endif
 
-		/* Turn on LED */
-		LED_set_level(false);
+			#ifdef NO_INT
+			#warning NO_INT set.
+			if (no_interrupt_counter > 38) //runs at about 52Hz, this doesn't have to be accurate.
+			{
+				no_interrupt_counter = 0;
+			#else 
+			if (measurement_interrupt_fired)
+			{
+			#endif
+				/* We can do a fair bit of work here once the ranging has complete, 
+				* because the VL53L1X is now busy getting another range ready. */
 
-		delay_ms(timeout_ms);
+				/* Reset the no interrupt timer */
+				if (current_ranging_mode == SET_CONTINUOUS_RANGING_MODE) TIMER_2_reset();
 
-		/* Turn off LED */
-		LED_set_level(true);
+				measurement_interrupt_fired = false;
 
-		/* Never decrement if -1 */
-		if (num_of_flashes > 0) num_of_flashes--;
-    }
-}
+				if (crosstalk_enabled || (intersensor_sync && is_master && current_ranging_mode == SET_CONTINUOUS_RANGING_MODE))
+				{
+					/* Create trigger after measurement finished.
+					   For sync, we assume a new measurement is already underway on master */
+					ADDR_OUT_set_level(false);
+				}     
 
-/**
- * \brief Translates the human readable measurement mode to API mode.
- * 
- * \param measurement_mode
- * 
- * \return uint8_t
- */
-static uint8_t translate_measurement_mode(uint8_t measurement_mode)
-{
-    if (measurement_mode == HIGHLY_ACCURATE) return 0;
+				/* If we are in measurement output modes */
+				if (led_mode == LED_MEASUREMENT_OUTPUT && !factory_mode) LED_set_level(false);
 
-    if (measurement_mode == LONG_RANGE) return 1;
+				if (gpio_mode == GPIO_MEASUREMENT_INTERRUPT && !factory_mode) SYNC_set_level(true);
 
-    if (measurement_mode == HIGH_SPEED) return 2;
+				/* Read current mm */
+				readRange(pDevice, &status, &measure);   
 
-	//This gets set by default in this method. So don't bother checking.
-    //if (measurement_mode == VL53L0X_DEFAULT) return 3;
+				if (intersensor_sync || crosstalk_enabled)
+				{
+					if (is_master && intersensor_sync)
+					{
+						if (current_ranging_mode == SET_CONTINUOUS_RANGING_MODE) resetVL53L1Interrupt(pDevice, &status);
+						else if (current_ranging_mode == SET_SINGLE_RANGING_MODE) stopContinuous(pDevice, &status);
+					}
+					// else do nothing
 
-	//We auto switch this range
-    //if (measurement_mode == MAPPYDOT_MODE) return 3;
-
-	return 3;
-}
-
-/**
- * \brief Translates the ranging mode for API mode
- * 
- * \param ranging_mode
- * 
- * \return uint8_t
- */
-static uint8_t translate_ranging_mode(uint8_t ranging_mode)
-{
-    if (ranging_mode == SET_CONTINUOUS_RANGING_MODE) return 1;
-
-	//if (ranging_mode == SET_SINGLE_RANGING_MODE) //Set by default
-	return 0;
-}
+				} else {
+					if (run_until_settle < 0)
+					{
+						if (current_ranging_mode == SET_CONTINUOUS_RANGING_MODE) resetVL53L1Interrupt(pDevice, &status);
+						else if (current_ranging_mode == SET_SINGLE_RANGING_MODE) stopContinuous(pDevice, &status);
+						} else {
+						resetVL53L1Interrupt(pDevice, &status);
+					}
+				}
 
 
-/**
- * \brief Average function
- * 
- * \param array
- * \param count
- * 
- * \return uint16_t
- */
-uint16_t avg(uint16_t * array, uint8_t count)
-{
-	uint16_t sum = 0;
+				error_code = measure.RangeStatus;
+				
+				/* If phase error */
+				if (measure.RangeStatus == 4)
+				{
+				    //current_millimeters = 0;
+				} else {
+				    prev_measurement = current_millimeters;
 
-	for(uint8_t i = 0; i < count; i++)
-	{
-		sum += array[i];
+					current_millimeters = measure.RangeMilliMeter;
+					if (current_millimeters == 0) current_millimeters = prev_measurement;
+				}			
+
+				distance_error = measure.SigmaMilliMeter >> 16; 
+				signal_rate_rtn_mega_cps = measure.SignalRateRtnMegaCps >> 16;
+				ambient_rate_rtn_mega_cps = measure.AmbientRateRtnMegaCps >> 16;
+
+				/* 0 is invalid measurement */
+
+				/* Do some sanity checking */
+				if (current_millimeters >= MAX_DIST) current_millimeters = prev_measurement; //0;
+
+				if (distance_error >= 10) current_millimeters = prev_measurement;
+
+				/* Valid measurements come out of the sensor as values > 30mm. */
+				if (current_millimeters <= MIN_DIST && current_millimeters > 0) current_millimeters = MIN_DIST;
+
+				real_distance = current_millimeters;
+				filtered_distance = real_distance;
+
+#ifndef DEV_DISABLE
+				/* Push current measurement into ring buffer for averaging */
+				hb_push_back(&history_buffer, &filtered_distance);
+
+				if (filtered_distance != 0)
+				{
+					if (filtering_enabled)
+					{
+						filtered_distance = bwlpf(filtered_distance, &low_pass_filter_state);
+
+						/* Ignore filtered distance if over max, this can happen when there is a rapid change 
+						   from no measurement to large value. This is because the filter does take time to settle
+						   but during this time the error code will generally be 7 */
+						if (ignore_next_filter > 0)
+						{
+							filtered_distance = real_distance;
+							ignore_next_filter--;
+						}
+
+						if ((filtered_distance > MAX_DIST || distance_error >= 7) && !ignore_next_filter)
+						{
+							filtered_distance = real_distance;
+							ignore_next_filter = FILTER_ORDER * 2;
+						}
+					}
+
+					/* Averaging happens after filtering */
+					if (averaging_enabled)
+					{
+						/* Wait for history buffer to fill */
+						if (current_average_size < averaging_size)
+						{
+							filtered_distance = real_distance;
+							current_average_size++;
+						}
+						else
+						{
+							filtered_distance = avg(history_buffer.buffer,averaging_size);
+							//memcpy(temp_buffer, (int16_t *)history_buffer.buffer, history_buffer.count);
+							//filtered_distance = quick_select_median(temp_buffer, history_buffer.count);
+						}
+					}
+
+				}
+	#endif
+				read_interrupt = 1;
+
+				/* We run continuous measurements until the device settles after init. When in single shot mode
+				   on startup, the interrupts don't fire after first few tries due to VL53L1_RANGESTATUS_RANGE_VALID_NO_WRAP_CHECK_FAIL */
+				if (run_until_settle == 0)
+				{
+					setRangingMode(pDevice, &status, translate_ranging_mode(current_ranging_mode), current_measurement_mode, measurement_budget);
+					run_until_settle--;
+				}
+				else if (run_until_settle > 0)
+				{
+					run_until_settle--;
+				}
+			
+				/* Output modes */
+				if (!factory_mode) 
+				{
+					if (led_mode == LED_THRESHOLD_ENABLED)
+					{
+						if (filtered_distance <= led_threshold && filtered_distance != 0)
+						{
+							/* Turn on LED */
+							LED_set_level(false);
+						}
+
+						else
+						{
+							/* Turn off LED */
+							LED_set_level(true);
+						}
+					}
+
+
+					/* Calculate "Software" (Timer Based) PWM */
+					/* This is pretty lightweight, it just uses software to calc the duty cycle.
+					 * Timers then work to fire the pins. */
+
+					if (measure.RangeStatus != 3 && measure.RangeStatus != 4) //If min range failure hasn't occurred
+					{ 
+
+						backpack_print(filtered_distance, 10);
+						backpack_writeDisplay();
+
+						if (filtered_distance > led_threshold) led_duty_cycle = 0;
+						else if (filtered_distance == 0) led_duty_cycle = 0; //Stop "bounce" when invalid measurement
+						else led_duty_cycle = (led_threshold - filtered_distance)*100/(led_threshold - MIN_DIST);
+
+						//if (led_duty_cycle > 99) led_duty_cycle = 99; // Done in set_duty
+
+				
+
+					} else {
+						//led_duty_cycle = 0;
+					
+					}
+					TIMER_1_set_duty(led_duty_cycle);
+
+				} 
+			}
+
+			else if (!crosstalk_enabled && interrupt_timeout_interrupt_fired)
+			{
+				interrupt_timeout_interrupt_fired = 0;
+
+				//Reset pullup on interrupt pin.
+				GPIO1_set_pull_mode(PORT_PULL_UP);
+
+				/* Reset interrupt if we have a communication timeout */
+				resetVL53L1Interrupt(pDevice, &status);
+				
+			}
+		}
 	}
-
-	return sum / count;
 }
 
 
+
+/**
+ * \brief Resets the VL53L0X ranging system. We do this here, because we control the XSHUT pin
+ * 
+ * 
+ * \return void
+ */
+static void reset_vl53l1x_ranging()
+{
+	stopContinuous(pDevice, &status);
+
+	/* Set XSHUT to low to turn off (Shutdown is active low). */
+	XSHUT_set_level(false);
+
+	/* Wait for shutdown */
+	delay_ms(100);
+
+	/* Set XSHUT to high to turn on (Shutdown is active low). */
+	XSHUT_set_level(true);
+
+	/* Boot time */
+	//delay_ms(T_BOOT_MS);
+	waitDeviceReady(pDevice,&status);
+
+	run_until_settle    = SETTLE_MEASUREMENTS;
+
+    init_ranging(pDevice, &status, 0, current_measurement_mode, measurement_budget, &ROI,
+			        &calibration_data, got_calibration_data);
+
+}
+
+
+#ifndef NO_INT
 /* Measurement Interrupt Fired */
 ISR (PCINT1_vect)
 {
@@ -483,43 +519,28 @@ ISR (PCINT1_vect)
         measurement_interrupt_fired = true;
     }
 }
+#endif
 
-/* GPIO PWM Timer (TIMER_0) */
-/* "Start" of the PWM signal. While COMPA resets after interrupt,
- * we can never get full off with this because there is always time.
- * until the next interrupt fire */
-ISR(TIMER1_COMPA_vect)
-
+/* Crosstalk/sync interrupt fired */
+ISR (PCINT0_vect)
 {
-    SYNC_set_level(true);
+
+	/* Pass on pulse straight away to next in chain */
+	if (intersensor_sync)
+	{
+		ADDR_OUT_set_level(ADDR_IN_get_level());
+	}
+
+	if(ADDR_IN_get_level() == 0)
+	{
+		crosstalk_sync_interrupt_fired = true;
+	}
 }
 
-/* Duty Cycle point */
-ISR(TIMER1_COMPB_vect)
+
+/* No interrupt overflow (this will fire every ~2000ms if no interrupt arrived) */
+ISR(TIMER4_OVF_vect)
 {
-    SYNC_set_level(false); 
+    interrupt_timeout_interrupt_fired = true;
 }
 
-/* LED PWM Timer (TIMER_1) */
-ISR(TIMER3_COMPA_vect)
-{
-    /* Turn on LED */
-    LED_set_level(false);
-
-}
-
-/* Duty Cycle point */
-ISR(TIMER3_COMPB_vect)
-{
-    /* Turn off LED */
-    LED_set_level(true);
-
-}
-
-/* Debugging purposes */
-ISR(BADISR_vect)
-{
-    /* Turn on LED */
-	//LED_set_level(true);
-	asm("nop;");
-}
